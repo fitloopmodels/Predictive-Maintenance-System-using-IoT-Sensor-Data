@@ -1,0 +1,16 @@
+predictive_maintenance/
+├── data/
+│   ├── raw/
+│   └── processed/
+├── notebooks/
+├── src/
+│   ├── data_preprocessing.py
+│   ├── feature_engineering.py
+│   ├── models.py
+│   └── visualization.py
+├── models/
+├── reports/
+├── requirements.txt
+├── config.py
+├── main.py
+└── README.md

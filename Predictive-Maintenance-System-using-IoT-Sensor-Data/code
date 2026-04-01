@@ -1,0 +1,858 @@
+"""
+Predictive Maintenance System for Industrial IoT Sensors
+Author: Predictive Maintenance Team
+Description: End-to-end predictive maintenance solution using NASA CMAPSS dataset
+Combines hardware sensor knowledge with machine learning for failure prediction
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import signal, fft
+from scipy.stats import skew, kurtosis
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (classification_report, confusion_matrix, 
+                           roc_auc_score, roc_curve, accuracy_score,
+                           precision_score, recall_score, f1_score)
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, callbacks
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import joblib
+import warnings
+import os
+from tqdm import tqdm
+from datetime import datetime
+
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+class Config:
+    """Configuration class for the predictive maintenance system"""
+    
+    # Path configurations
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATA_DIR = os.path.join(BASE_DIR, 'data')
+    RAW_DATA_DIR = os.path.join(DATA_DIR, 'raw')
+    PROCESSED_DATA_DIR = os.path.join(DATA_DIR, 'processed')
+    MODELS_DIR = os.path.join(BASE_DIR, 'models')
+    REPORTS_DIR = os.path.join(BASE_DIR, 'reports')
+    
+    # Create directories
+    for dir_path in [RAW_DATA_DIR, PROCESSED_DATA_DIR, MODELS_DIR, REPORTS_DIR]:
+        os.makedirs(dir_path, exist_ok=True)
+    
+    # Data parameters
+    SENSOR_COLS = [f'sensor_{i}' for i in range(1, 22)]  # 21 sensors
+    OP_SETTINGS = ['op_setting_1', 'op_setting_2', 'op_setting_3']
+    
+    # Feature engineering parameters
+    WINDOW_SIZES = [5, 10, 15, 20]
+    FFT_COMPONENTS = 10
+    ROLLING_STATS = ['mean', 'std', 'min', 'max', 'skew']
+    
+    # Model parameters
+    RANDOM_STATE = 42
+    TEST_SIZE = 0.2
+    VAL_SIZE = 0.1
+    
+    # LSTM parameters
+    LSTM_SEQUENCE_LENGTH = 50
+    LSTM_BATCH_SIZE = 64
+    LSTM_EPOCHS = 100
+    LSTM_UNITS = [64, 32]
+    
+    # Failure threshold (cycles before failure)
+    FAILURE_THRESHOLD = 30
+
+config = Config()
+
+# ============================================================================
+# DATA PREPROCESSING MODULE
+# ============================================================================
+
+class DataPreprocessor:
+    """Handles data loading, cleaning, and preprocessing"""
+    
+    def __init__(self, scaler_type='standard'):
+        self.scaler_type = scaler_type
+        if scaler_type == 'standard':
+            self.scaler = StandardScaler()
+        else:
+            self.scaler = MinMaxScaler()
+        self.is_fitted = False
+        self.remaining_sensors = None
+    
+    def load_cmapss_data(self, file_path):
+        """
+        Load NASA CMAPSS dataset
+        Columns: unit_nr, time_cycles, op_setting_1, op_setting_2, 
+                 op_setting_3, sensor_1...sensor_21
+        """
+        column_names = ['unit_nr', 'time_cycles'] + config.OP_SETTINGS + config.SENSOR_COLS
+        df = pd.read_csv(file_path, sep='\s+', header=None, names=column_names)
+        print(f"Loaded data: {df.shape[0]} rows, {df.shape[1]} columns")
+        return df
+    
+    def add_remaining_useful_life(self, df):
+        """Add RUL (Remaining Useful Life) column"""
+        rul = pd.DataFrame(df.groupby('unit_nr')['time_cycles'].max()).reset_index()
+        rul.columns = ['unit_nr', 'max_cycles']
+        df = df.merge(rul, on=['unit_nr'])
+        df['rul'] = df['max_cycles'] - df['time_cycles']
+        df.drop('max_cycles', axis=1, inplace=True)
+        return df
+    
+    def add_failure_label(self, df, threshold=None):
+        """Add binary failure label based on RUL threshold"""
+        if threshold is None:
+            threshold = config.FAILURE_THRESHOLD
+        df['failure_label'] = (df['rul'] <= threshold).astype(int)
+        return df
+    
+    def remove_constant_sensors(self, df):
+        """Remove sensors with constant values (no variation)"""
+        constant_cols = []
+        for col in config.SENSOR_COLS:
+            if col in df.columns and df[col].nunique() == 1:
+                constant_cols.append(col)
+                print(f"Removing constant sensor: {col}")
+        
+        if constant_cols:
+            df = df.drop(columns=constant_cols)
+            self.remaining_sensors = [col for col in config.SENSOR_COLS 
+                                      if col not in constant_cols]
+        else:
+            self.remaining_sensors = config.SENSOR_COLS
+        
+        return df
+    
+    def normalize_data(self, df, columns_to_normalize):
+        """Normalize sensor and operational setting data"""
+        if not self.is_fitted:
+            df[columns_to_normalize] = self.scaler.fit_transform(df[columns_to_normalize])
+            self.is_fitted = True
+        else:
+            df[columns_to_normalize] = self.scaler.transform(df[columns_to_normalize])
+        return df
+    
+    def remove_outliers(self, df, columns, n_std=3):
+        """Remove outliers using standard deviation method"""
+        for col in columns:
+            mean = df[col].mean()
+            std = df[col].std()
+            df = df[(df[col] <= mean + n_std * std) & 
+                    (df[col] >= mean - n_std * std)]
+        return df
+    
+    def save_scaler(self, path):
+        """Save the fitted scaler"""
+        joblib.dump(self.scaler, path)
+    
+    def load_scaler(self, path):
+        """Load a fitted scaler"""
+        self.scaler = joblib.load(path)
+        self.is_fitted = True
+    
+    def create_sequences(self, data, labels, sequence_length):
+        """Create sequences for LSTM model"""
+        X, y = [], []
+        for i in tqdm(range(len(data) - sequence_length), desc="Creating sequences"):
+            X.append(data[i:(i + sequence_length)])
+            y.append(labels[i + sequence_length])
+        return np.array(X), np.array(y)
+    
+    def prepare_data_for_lstm(self, df, sequence_length, test_size=0.2):
+        """Prepare data for LSTM model with train/test split"""
+        # Get features and labels
+        feature_cols = [col for col in df.columns 
+                       if col not in ['unit_nr', 'time_cycles', 'rul', 'failure_label']]
+        X = df[feature_cols].values
+        y = df['failure_label'].values
+        
+        # Split by units to avoid data leakage
+        unique_units = df['unit_nr'].unique()
+        train_units, test_units = train_test_split(unique_units, test_size=test_size, 
+                                                   random_state=config.RANDOM_STATE)
+        
+        train_mask = df['unit_nr'].isin(train_units)
+        test_mask = df['unit_nr'].isin(test_units)
+        
+        X_train, y_train = X[train_mask], y[train_mask]
+        X_test, y_test = X[test_mask], y[test_mask]
+        
+        # Create sequences
+        X_train_seq, y_train_seq = self.create_sequences(X_train, y_train, sequence_length)
+        X_test_seq, y_test_seq = self.create_sequences(X_test, y_test, sequence_length)
+        
+        # Split validation from training
+        val_size = int(len(X_train_seq) * config.VAL_SIZE)
+        X_val_seq, y_val_seq = X_train_seq[-val_size:], y_train_seq[-val_size:]
+        X_train_seq, y_train_seq = X_train_seq[:-val_size], y_train_seq[:-val_size]
+        
+        return (X_train_seq, y_train_seq), (X_val_seq, y_val_seq), (X_test_seq, y_test_seq)
+
+# ============================================================================
+# FEATURE ENGINEERING MODULE
+# ============================================================================
+
+class FeatureEngineer:
+    """Engineers time-series and frequency domain features"""
+    
+    def __init__(self):
+        self.feature_names = []
+    
+    def add_rolling_statistics(self, df, columns, window_sizes):
+        """Add rolling statistics for time-series data"""
+        for col in columns:
+            for window in window_sizes:
+                for stat in config.ROLLING_STATS:
+                    feature_name = f'{col}_rolling_{stat}_w{window}'
+                    if stat == 'mean':
+                        df[feature_name] = df.groupby('unit_nr')[col].transform(
+                            lambda x: x.rolling(window, min_periods=1).mean()
+                        )
+                    elif stat == 'std':
+                        df[feature_name] = df.groupby('unit_nr')[col].transform(
+                            lambda x: x.rolling(window, min_periods=1).std()
+                        )
+                    elif stat == 'min':
+                        df[feature_name] = df.groupby('unit_nr')[col].transform(
+                            lambda x: x.rolling(window, min_periods=1).min()
+                        )
+                    elif stat == 'max':
+                        df[feature_name] = df.groupby('unit_nr')[col].transform(
+                            lambda x: x.rolling(window, min_periods=1).max()
+                        )
+                    elif stat == 'skew':
+                        df[feature_name] = df.groupby('unit_nr')[col].transform(
+                            lambda x: x.rolling(window, min_periods=1).apply(skew)
+                        )
+                    
+                    # Fill NaN values
+                    df[feature_name].fillna(0, inplace=True)
+                    self.feature_names.append(feature_name)
+        
+        return df
+    
+    def add_rate_of_change(self, df, columns):
+        """Add rate of change (derivative) features"""
+        for col in columns:
+            feature_name = f'{col}_roc'
+            df[feature_name] = df.groupby('unit_nr')[col].diff()
+            df[feature_name].fillna(0, inplace=True)
+            self.feature_names.append(feature_name)
+        
+        return df
+    
+    def add_fft_features(self, df, columns, n_components=10):
+        """Add FFT features for frequency domain analysis"""
+        for col in columns:
+            fft_features = []
+            for unit_id, group in df.groupby('unit_nr'):
+                series = group[col].values
+                if len(series) > 1:
+                    fft_vals = np.abs(fft.fft(series))
+                    top_fft = fft_vals[1:n_components+1]  # Skip DC component
+                    
+                    fft_dict = {'unit_nr': unit_id}
+                    for i, val in enumerate(top_fft):
+                        fft_dict[f'{col}_fft_{i}'] = val
+                    fft_features.append(fft_dict)
+            
+            if fft_features:
+                fft_df = pd.DataFrame(fft_features)
+                df = df.merge(fft_df, on='unit_nr', how='left')
+                
+                for i in range(n_components):
+                    feature_name = f'{col}_fft_{i}'
+                    if feature_name in df.columns:
+                        df[feature_name].fillna(0, inplace=True)
+                        self.feature_names.append(feature_name)
+        
+        return df
+    
+    def add_spectral_energy(self, df, columns):
+        """Add spectral energy features"""
+        for col in columns:
+            spectral_features = []
+            for unit_id, group in df.groupby('unit_nr'):
+                series = group[col].values
+                if len(series) > 1:
+                    freqs, psd = signal.periodogram(series, fs=1.0)
+                    total_energy = np.sum(psd)
+                    low_freq_idx = len(freqs) // 4
+                    low_freq_energy = np.sum(psd[:low_freq_idx])
+                    high_freq_idx = 3 * len(freqs) // 4
+                    high_freq_energy = np.sum(psd[high_freq_idx:])
+                    
+                    spectral_features.append({
+                        'unit_nr': unit_id,
+                        f'{col}_total_energy': total_energy,
+                        f'{col}_low_freq_energy': low_freq_energy,
+                        f'{col}_high_freq_energy': high_freq_energy,
+                        f'{col}_energy_ratio': low_freq_energy / (total_energy + 1e-6)
+                    })
+            
+            if spectral_features:
+                energy_df = pd.DataFrame(spectral_features)
+                df = df.merge(energy_df, on='unit_nr', how='left')
+                
+                for suffix in ['total_energy', 'low_freq_energy', 'high_freq_energy', 'energy_ratio']:
+                    feature_name = f'{col}_{suffix}'
+                    if feature_name in df.columns:
+                        df[feature_name].fillna(0, inplace=True)
+                        self.feature_names.append(feature_name)
+        
+        return df
+    
+    def add_statistical_features(self, df, columns):
+        """Add statistical features for each unit"""
+        for col in columns:
+            stats = []
+            for unit_id, group in df.groupby('unit_nr'):
+                series = group[col].values
+                stats.append({
+                    'unit_nr': unit_id,
+                    f'{col}_mean': np.mean(series),
+                    f'{col}_std': np.std(series),
+                    f'{col}_skew': skew(series) if len(series) > 1 else 0,
+                    f'{col}_kurtosis': kurtosis(series) if len(series) > 1 else 0,
+                    f'{col}_min': np.min(series),
+                    f'{col}_max': np.max(series),
+                    f'{col}_range': np.max(series) - np.min(series)
+                })
+            
+            stats_df = pd.DataFrame(stats)
+            df = df.merge(stats_df, on='unit_nr', how='left')
+            
+            for suffix in ['mean', 'std', 'skew', 'kurtosis', 'min', 'max', 'range']:
+                feature_name = f'{col}_{suffix}'
+                if feature_name in df.columns:
+                    df[feature_name].fillna(0, inplace=True)
+                    self.feature_names.append(feature_name)
+        
+        return df
+    
+    def engineer_all_features(self, df, sensor_cols, op_cols):
+        """Apply all feature engineering techniques"""
+        all_cols = sensor_cols + op_cols
+        
+        print("Adding rolling statistics...")
+        df = self.add_rolling_statistics(df, all_cols, config.WINDOW_SIZES)
+        
+        print("Adding rate of change features...")
+        df = self.add_rate_of_change(df, all_cols)
+        
+        print("Adding FFT features...")
+        df = self.add_fft_features(df, all_cols, config.FFT_COMPONENTS)
+        
+        print("Adding spectral energy features...")
+        df = self.add_spectral_energy(df, all_cols)
+        
+        print("Adding statistical features...")
+        df = self.add_statistical_features(df, all_cols)
+        
+        print(f"Total features engineered: {len(self.feature_names)}")
+        return df
+
+# ============================================================================
+# MODEL MODULE
+# ============================================================================
+
+class RandomForestModel:
+    """Random Forest classifier for failure prediction"""
+    
+    def __init__(self, n_estimators=100, max_depth=None, random_state=config.RANDOM_STATE):
+        self.model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight='balanced'
+        )
+        self.feature_importance = None
+        self.metrics = {}
+    
+    def train(self, X_train, y_train):
+        """Train Random Forest model"""
+        print("\nTraining Random Forest model...")
+        self.model.fit(X_train, y_train)
+        
+        # Calculate feature importance
+        self.feature_importance = pd.DataFrame({
+            'feature': X_train.columns if hasattr(X_train, 'columns') 
+                      else [f'feature_{i}' for i in range(X_train.shape[1])],
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        return self.model
+    
+    def hyperparameter_tuning(self, X_train, y_train, cv=3):
+        """Hyperparameter tuning using GridSearchCV"""
+        print("\nPerforming hyperparameter tuning...")
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [10, 20, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4]
+        }
+        
+        grid_search = GridSearchCV(
+            self.model, param_grid, cv=cv, scoring='roc_auc', 
+            n_jobs=-1, verbose=1
+        )
+        grid_search.fit(X_train, y_train)
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best cross-validation score: {grid_search.best_score_:.4f}")
+        
+        self.model = grid_search.best_estimator_
+        return self.model
+    
+    def predict(self, X_test):
+        """Make predictions"""
+        return self.model.predict(X_test)
+    
+    def predict_proba(self, X_test):
+        """Get prediction probabilities"""
+        return self.model.predict_proba(X_test)[:, 1]
+    
+    def evaluate(self, X_test, y_test):
+        """Evaluate model performance"""
+        y_pred = self.predict(X_test)
+        y_proba = self.predict_proba(X_test)
+        
+        self.metrics = {
+            'accuracy': accuracy_score(y_test, y_pred),
+            'precision': precision_score(y_test, y_pred),
+            'recall': recall_score(y_test, y_pred),
+            'f1': f1_score(y_test, y_pred),
+            'roc_auc': roc_auc_score(y_test, y_proba)
+        }
+        
+        print("\n" + "="*50)
+        print("RANDOM FOREST MODEL PERFORMANCE")
+        print("="*50)
+        print(f"Accuracy:  {self.metrics['accuracy']:.4f}")
+        print(f"Precision: {self.metrics['precision']:.4f}")
+        print(f"Recall:    {self.metrics['recall']:.4f}")
+        print(f"F1-Score:  {self.metrics['f1']:.4f}")
+        print(f"ROC-AUC:   {self.metrics['roc_auc']:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        return self.metrics
+    
+    def plot_feature_importance(self, top_n=20):
+        """Plot feature importance"""
+        if self.feature_importance is None:
+            print("Model not trained yet!")
+            return None
+        
+        plt.figure(figsize=(10, 8))
+        top_features = self.feature_importance.head(top_n)
+        plt.barh(range(len(top_features)), top_features['importance'].values)
+        plt.yticks(range(len(top_features)), top_features['feature'].values)
+        plt.xlabel('Feature Importance')
+        plt.title(f'Top {top_n} Feature Importance - Random Forest')
+        plt.tight_layout()
+        return plt
+    
+    def save_model(self, path):
+        """Save model to disk"""
+        joblib.dump(self.model, path)
+        if self.feature_importance is not None:
+            self.feature_importance.to_csv(path.replace('.pkl', '_feature_importance.csv'))
+        print(f"Model saved to {path}")
+    
+    def load_model(self, path):
+        """Load model from disk"""
+        self.model = joblib.load(path)
+        print(f"Model loaded from {path}")
+
+class LSTMModel:
+    """LSTM neural network for sequence-based failure prediction"""
+    
+    def __init__(self, sequence_length, n_features, n_units=None, dropout_rate=0.3):
+        self.sequence_length = sequence_length
+        self.n_features = n_features
+        self.n_units = n_units or config.LSTM_UNITS
+        self.dropout_rate = dropout_rate
+        self.model = None
+        self.history = None
+        self.metrics = {}
+    
+    def build_model(self):
+        """Build LSTM model architecture"""
+        model = models.Sequential()
+        
+        # First LSTM layer
+        model.add(layers.LSTM(
+            self.n_units[0], 
+            return_sequences=True if len(self.n_units) > 1 else False,
+            input_shape=(self.sequence_length, self.n_features)
+        ))
+        model.add(layers.Dropout(self.dropout_rate))
+        
+        # Additional LSTM layers
+        for i in range(1, len(self.n_units)):
+            return_seq = i < len(self.n_units) - 1
+            model.add(layers.LSTM(self.n_units[i], return_sequences=return_seq))
+            model.add(layers.Dropout(self.dropout_rate))
+        
+        # Dense layers
+        model.add(layers.Dense(32, activation='relu'))
+        model.add(layers.Dropout(self.dropout_rate))
+        model.add(layers.Dense(16, activation='relu'))
+        model.add(layers.Dense(1, activation='sigmoid'))
+        
+        # Compile model
+        model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy', tf.keras.metrics.AUC(name='auc')]
+        )
+        
+        self.model = model
+        print("\nLSTM Model Architecture:")
+        model.summary()
+        return model
+    
+    def train(self, train_data, val_data, epochs=None, batch_size=None):
+        """Train LSTM model"""
+        X_train, y_train = train_data
+        X_val, y_val = val_data
+        
+        epochs = epochs or config.LSTM_EPOCHS
+        batch_size = batch_size or config.LSTM_BATCH_SIZE
+        
+        print("\nTraining LSTM model...")
+        
+        # Callbacks
+        early_stopping = callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1
+        )
+        
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1
+        )
+        
+        checkpoint = callbacks.ModelCheckpoint(
+            os.path.join(config.MODELS_DIR, 'lstm_best.h5'),
+            monitor='val_auc',
+            mode='max',
+            save_best_only=True,
+            verbose=1
+        )
+        
+        # Train model
+        self.history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[early_stopping, reduce_lr, checkpoint],
+            verbose=1
+        )
+        
+        return self.history
+    
+    def predict(self, X_test):
+        """Make predictions"""
+        return (self.model.predict(X_test) > 0.5).astype(int).flatten()
+    
+    def predict_proba(self, X_test):
+        """Get prediction probabilities"""
+        return self.model.predict(X_test).flatten()
+    
+    def evaluate(self, X_test, y_test):
+        """Evaluate model performance"""
+        y_pred = self.predict(X_test)
+        y_proba = self.predict_proba(X_test)
+        
+        self.metrics = {
+            'accuracy': accuracy_score(y_test, y_pred),
+            'precision': precision_score(y_test, y_pred),
+            'recall': recall_score(y_test, y_pred),
+            'f1': f1_score(y_test, y_pred),
+            'roc_auc': roc_auc_score(y_test, y_proba)
+        }
+        
+        print("\n" + "="*50)
+        print("LSTM MODEL PERFORMANCE")
+        print("="*50)
+        print(f"Accuracy:  {self.metrics['accuracy']:.4f}")
+        print(f"Precision: {self.metrics['precision']:.4f}")
+        print(f"Recall:    {self.metrics['recall']:.4f}")
+        print(f"F1-Score:  {self.metrics['f1']:.4f}")
+        print(f"ROC-AUC:   {self.metrics['roc_auc']:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+        return self.metrics
+    
+    def plot_training_history(self):
+        """Plot training history"""
+        if self.history is None:
+            print("Model not trained yet!")
+            return None
+        
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        
+        # Loss
+        axes[0].plot(self.history.history['loss'], label='Training Loss')
+        axes[0].plot(self.history.history['val_loss'], label='Validation Loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_title('Model Loss')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Accuracy
+        axes[1].plot(self.history.history['accuracy'], label='Training Accuracy')
+        axes[1].plot(self.history.history['val_accuracy'], label='Validation Accuracy')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy')
+        axes[1].set_title('Model Accuracy')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        
+        # AUC
+        axes[2].plot(self.history.history['auc'], label='Training AUC')
+        axes[2].plot(self.history.history['val_auc'], label='Validation AUC')
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('AUC')
+        axes[2].set_title('Model AUC')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return plt
+    
+    def save_model(self, path):
+        """Save model to disk"""
+        self.model.save(path)
+        print(f"Model saved to {path}")
+    
+    def load_model(self, path):
+        """Load model from disk"""
+        self.model = keras.models.load_model(path)
+        print(f"Model loaded from {path}")
+
+# ============================================================================
+# VISUALIZATION MODULE
+# ============================================================================
+
+class Visualizer:
+    """Visualization utilities for EDA and model evaluation"""
+    
+    def __init__(self, style='seaborn-v0_8'):
+        plt.style.use(style)
+        sns.set_palette("husl")
+    
+    def plot_sensor_trends(self, df, units_to_plot=None, n_sensors=6):
+        """Plot sensor degradation trends for selected units"""
+        if units_to_plot is None:
+            units_to_plot = df['unit_nr'].unique()[:3]
+        
+        # Select sensors with highest variance
+        sensor_cols = [col for col in df.columns if 'sensor_' in col]
+        variances = df[sensor_cols].var().sort_values(ascending=False)
+        sensors_to_plot = variances.head(n_sensors).index.tolist()
+        
+        fig, axes = plt.subplots(len(sensors_to_plot), 1, figsize=(15, 3*len(sensors_to_plot)))
+        if len(sensors_to_plot) == 1:
+            axes = [axes]
+        
+        for idx, sensor in enumerate(sensors_to_plot):
+            for unit in units_to_plot:
+                unit_data = df[df['unit_nr'] == unit]
+                axes[idx].plot(unit_data['time_cycles'], unit_data[sensor], 
+                              label=f'Unit {unit}', linewidth=2, alpha=0.7)
+                
+                # Mark failure threshold
+                failure_cycles = unit_data[unit_data['failure_label'] == 1]['time_cycles']
+                if len(failure_cycles) > 0:
+                    axes[idx].axvline(x=failure_cycles.min(), color='red', 
+                                    linestyle='--', alpha=0.5, linewidth=1)
+            
+            axes[idx].set_xlabel('Time Cycles')
+            axes[idx].set_ylabel(sensor)
+            axes[idx].set_title(f'{sensor} Degradation Trend')
+            axes[idx].legend(loc='upper right')
+            axes[idx].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return plt
+    
+    def plot_rul_distribution(self, df):
+        """Plot RUL distribution and failure threshold"""
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # RUL distribution
+        axes[0].hist(df['rul'], bins=50, edgecolor='black', alpha=0.7, color='blue')
+        axes[0].axvline(x=config.FAILURE_THRESHOLD, color='red', 
+                       linestyle='--', linewidth=2, label=f'Failure Threshold ({config.FAILURE_THRESHOLD} cycles)')
+        axes[0].set_xlabel('Remaining Useful Life (cycles)')
+        axes[0].set_ylabel('Frequency')
+        axes[0].set_title('RUL Distribution')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Failure label distribution
+        failure_counts = df['failure_label'].value_counts()
+        colors = ['green', 'red']
+        bars = axes[1].bar(['Healthy (0)', 'Failure (1)'], failure_counts.values, 
+                          color=colors, alpha=0.7, edgecolor='black')
+        
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            axes[1].text(bar.get_x() + bar.get_width()/2., height,
+                        f'{int(height)}', ha='center', va='bottom')
+        
+        axes[1].set_ylabel('Count')
+        axes[1].set_title('Failure Label Distribution')
+        axes[1].grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        return plt
+    
+    def plot_correlation_matrix(self, df, n_features=20):
+        """Plot correlation matrix of top features"""
+        # Select top features by variance
+        feature_cols = [col for col in df.columns 
+                       if col not in ['unit_nr', 'time_cycles', 'rul', 'failure_label']]
+        
+        if len(feature_cols) > n_features:
+            variances = df[feature_cols].var().sort_values(ascending=False)
+            feature_cols = variances.head(n_features).index.tolist()
+        
+        corr_matrix = df[feature_cols + ['failure_label']].corr()
+        
+        plt.figure(figsize=(12, 10))
+        mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+        sns.heatmap(corr_matrix, mask=mask, annot=True, fmt='.2f', 
+                   cmap='coolwarm', center=0, square=True, 
+                   linewidths=0.5, cbar_kws={"shrink": 0.8})
+        plt.title('Feature Correlation Matrix')
+        plt.tight_layout()
+        return plt
+    
+    def plot_confusion_matrix(self, y_true, y_pred, title='Confusion Matrix'):
+        """Plot confusion matrix"""
+        cm = confusion_matrix(y_true, y_pred)
+        
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=['Healthy', 'Failure'], 
+                   yticklabels=['Healthy', 'Failure'])
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.title(title)
+        plt.tight_layout()
+        return plt
+    
+    def plot_roc_curves(self, models_predictions, test_labels):
+        """Plot ROC curves for multiple models"""
+        plt.figure(figsize=(10, 8))
+        
+        for model_name, predictions in models_predictions.items():
+            fpr, tpr, _ = roc_curve(test_labels, predictions)
+            roc_auc = np.trapz(tpr, fpr)
+            plt.plot(fpr, tpr, label=f'{model_name} (AUC = {roc_auc:.3f})', linewidth=2)
+        
+        plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier', alpha=0.5)
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curves Comparison')
+        plt.legend(loc="lower right")
+        plt.grid(True, alpha=0.3)
+        
+        return plt
+    
+    def plot_model_comparison(self, models_results):
+        """Compare different models' performance metrics"""
+        metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score', 'ROC-AUC']
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        x = np.arange(len(metrics))
+        width = 0.35
+        
+        for i, (model_name, results) in enumerate(models_results.items()):
+            scores = [results[metric.lower().replace('-', '_')] for metric in metrics]
+            bars = ax.bar(x + i*width, scores, width, label=model_name)
+            
+            # Add value labels on bars
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+        
+        ax.set_xlabel('Metrics')
+        ax.set_ylabel('Score')
+        ax.set_title('Model Performance Comparison')
+        ax.set_xticks(x + width/2)
+        ax.set_xticklabels(metrics)
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.set_ylim([0, 1])
+        
+        plt.tight_layout()
+        return plt
+    
+    def plot_anomaly_detection(self, df, unit_id, sensor, window=20):
+        """Plot anomaly detection using statistical methods"""
+        unit_data = df[df['unit_nr'] == unit_id].copy()
+        
+        # Calculate rolling statistics
+        rolling_mean = unit_data[sensor].rolling(window=window, min_periods=1).mean()
+        rolling_std = unit_data[sensor].rolling(window=window, min_periods=1).std()
+        upper_bound = rolling_mean + 2 * rolling_std
+        lower_bound = rolling_mean - 2 * rolling_std
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(unit_data['time_cycles'], unit_data[sensor], 
+                label='Sensor Reading', linewidth=1.5, alpha=0.7, color='blue')
+        plt.plot(unit_data['time_cycles'], rolling_mean, 
+                label='Rolling Mean', linewidth=2, color='orange')
+        plt.fill_between(unit_data['time_cycles'], lower_bound, upper_bound, 
+                        alpha=0.3, color='gray', label='±2σ Band')
+        
+        # Highlight anomalies
+        z_scores = np.abs((unit_data[sensor] - rolling_mean) / (rolling_std + 1e-6))
+        anomalies = unit_data[z_scores > 2]
+        plt.scatter(anomalies['time_cycles'], anomalies[sensor], 
+                   color='red', s=50, label='Anomalies', zorder=5, alpha=0.6)
+        
+        # Mark failure threshold
+        failure_cycles = unit_data[unit_data['failure_label'] == 1]['time_cycles']
+        if len(failure_cycles) > 0:
+            plt.axvline(x=failure_cycles.min(), color='red', 
+                       linestyle='--', alpha=0.5, linewidth=1, label='Failure Threshold')   
+            
+        plt.xlabel('Time Cycles')
+        plt.ylabel(sensor)  
+        plt.title(f'Anomaly Detection for Unit {unit_id} - {sensor}')
+        plt.legend(loc='upper right')       
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()              
+        return plt      
+                            
